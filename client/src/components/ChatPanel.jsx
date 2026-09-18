@@ -1,5 +1,15 @@
 import { useState, useRef, useEffect } from "react";
-import { sendChatMessage } from "../api";
+import { fetchSessionHistory, sendChatMessage } from "../api";
+
+// One session per browser tab. It survives a refresh, so the chat can be restored.
+function tabSessionId() {
+  let id = sessionStorage.getItem("sessionId");
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem("sessionId", id);
+  }
+  return id;
+}
 
 export default function ChatPanel({ onGraphMightHaveChanged }) {
   const [messages, setMessages] = useState([]);
@@ -7,6 +17,22 @@ export default function ChatPanel({ onGraphMightHaveChanged }) {
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState(null);
   const scrollRef = useRef(null);
+  const sessionId = useRef(tabSessionId()).current;
+  const failed = useRef(null); // { messageId, text } of the last message that errored
+
+  // The server owns the conversation: restore it after a refresh.
+  useEffect(() => {
+    fetchSessionHistory(sessionId)
+      .then(({ messages: history }) =>
+        setMessages(
+          history.flatMap((m) => [
+            { role: "user", content: m.userText },
+            { role: "assistant", content: m.replyText },
+          ]),
+        ),
+      )
+      .catch((err) => console.error(err));
+  }, [sessionId]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -17,6 +43,8 @@ export default function ChatPanel({ onGraphMightHaveChanged }) {
     const text = input.trim();
     if (!text || isSending) return;
 
+    // Resending the text that just failed reuses its messageId, so the server can't run it twice.
+    const messageId = failed.current?.text === text ? failed.current.messageId : crypto.randomUUID();
     const nextMessages = [...messages, { role: "user", content: text }];
     setMessages(nextMessages);
     setInput("");
@@ -24,7 +52,8 @@ export default function ChatPanel({ onGraphMightHaveChanged }) {
     setError(null);
 
     try {
-      const { reply } = await sendChatMessage(nextMessages);
+      const { reply } = await sendChatMessage({ sessionId, messageId, text });
+      failed.current = null;
       setMessages([...nextMessages, { role: "assistant", content: reply }]);
       // The graph endpoint is polled independently, but nudging a refresh
       // right after a turn keeps the visualization feeling responsive once
@@ -32,7 +61,10 @@ export default function ChatPanel({ onGraphMightHaveChanged }) {
       onGraphMightHaveChanged?.();
     } catch (err) {
       console.error(err);
-      setError("Something went wrong talking to the model.");
+      failed.current = { messageId, text };
+      setMessages(messages);
+      setInput(text);
+      setError("Something went wrong talking to the model. Press Send to try again.");
     } finally {
       setIsSending(false);
     }
